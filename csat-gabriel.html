@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Analisador de CSAT — Gabriel CX</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; background: #f9fafb; margin: 0; }
+  textarea { font-family: inherit; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: #f1f1f1; }
+  ::-webkit-scrollbar-thumb { background: #d1d5db; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useMemo, useCallback } = React;
+
+const TEMAS = [
+  "Tempo de resposta","Resolução no primeiro contato","Empatia do atendente",
+  "Clareza da comunicação","Personalização","Proatividade","Continuidade / histórico",
+  "Limitação do produto","Bug / falha técnica","Expectativa vs. entrega",
+  "Transferências / escaladas","Outro"
+];
+const JORNADAS = ["Experiência","Ocorrência"];
+const BADGE_MAP = {
+  "P1":"bg-red-100 text-red-700 border-red-300","P2":"bg-yellow-100 text-yellow-700 border-yellow-300",
+  "P3":"bg-green-100 text-green-700 border-green-300",
+  "Dissonante positivo":"bg-purple-100 text-purple-700 border-purple-300",
+  "Dissonante negativo":"bg-orange-100 text-orange-700 border-orange-300",
+  "Alinhado":"bg-blue-100 text-blue-700 border-blue-300",
+};
+
+const Badge = ({ val }) => (
+  <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${BADGE_MAP[val]||"bg-gray-100 text-gray-600 border-gray-300"}`}>{val}</span>
+);
+const Bar = ({ value, max, color }) => (
+  <div className="h-1.5 bg-gray-100 rounded-full w-full">
+    <div className={`h-1.5 rounded-full ${color}`} style={{width: max ? `${(value/max)*100}%` : "0%"}}/>
+  </div>
+);
+const notaCor = n => {
+  const nn = Number(n);
+  if (nn <= 2) return "text-red-600 font-bold";
+  if (nn === 3) return "text-yellow-600 font-bold";
+  return "text-green-600 font-bold";
+};
+const newId = () => `${Date.now()}-${Math.random().toString(36).slice(2,7)}`;
+const emptyRow = () => ({ id:newId(), recordId:"", nome:"", jornada:"Experiência", data:"", nota:"", comentario:"", tema:"", tipoComentario:"", tensao:"", flagCritico:false, prioridade:"", obs:"", analisando:false });
+
+async function analisarComIA(nota, comentario, jornada) {
+  const prompt = `Você é um analista de CX especialista em CSAT. Analise a resposta abaixo e retorne APENAS um JSON válido, sem markdown.
+
+Nota: ${nota}/5 | Jornada: ${jornada}
+Comentário: "${comentario}"
+
+Retorne exatamente:
+{"tema":"<Tempo de resposta|Resolução no primeiro contato|Empatia do atendente|Clareza da comunicação|Personalização|Proatividade|Continuidade / histórico|Limitação do produto|Bug / falha técnica|Expectativa vs. entrega|Transferências / escaladas|Outro>","tipoComentario":"<Emocional|Funcional|Comparativo|Vazio>","tensao":"<Alinhado|Dissonante positivo|Dissonante negativo>","prioridade":"<P1|P2|P3>","resumoInsight":"<frase de até 15 palavras>"}
+
+Regras: Dissonante positivo=nota baixa+comentário neutro/positivo. Dissonante negativo=nota alta+ressalva. P1=nota<=2 e tema grave. P2=nota 3 ou dissonante. P3=resto.`;
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({ model:"claude-sonnet-4-20250514", max_tokens:1000, messages:[{role:"user",content:prompt}] })
+  });
+  const data = await res.json();
+  const text = data.content?.find(b => b.type==="text")?.text || "{}";
+  return JSON.parse(text.replace(/```json|```/g,"").trim());
+}
+
+async function syncSheet(url, action, payload) {
+  try { await fetch(url, {method:"POST", body:JSON.stringify({action,...payload})}); } catch {}
+}
+async function loadSheet(url) {
+  try { const res = await fetch(url); const data = await res.json(); return data.ok ? data.data : null; } catch { return null; }
+}
+
+function App() {
+  const [rows, setRows] = useState([emptyRow()]);
+  const [tab, setTab] = useState("tabela");
+  const [sheetUrl, setSheetUrl] = useState(() => localStorage.getItem("gabriel_sheet_url") || "");
+  const [sheetUrlInput, setSheetUrlInput] = useState(() => localStorage.getItem("gabriel_sheet_url") || "");
+  const [sheetStatus, setSheetStatus] = useState("idle");
+  const [analisandoTodos, setAnalisandoTodos] = useState(false);
+  const [filtroJornada, setFiltroJornada] = useState("Todas");
+  const [filtroInicio, setFiltroInicio] = useState("");
+  const [filtroFim, setFiltroFim] = useState("");
+
+  const upd = (id, f, v) => setRows(r => r.map(row => row.id===id ? {...row,[f]:v} : row));
+  const addRow = () => setRows(r => [...r, emptyRow()]);
+
+  const conectar = useCallback(async () => {
+    if (!sheetUrlInput.trim()) return;
+    setSheetStatus("loading");
+    const data = await loadSheet(sheetUrlInput.trim());
+    if (data !== null) {
+      setSheetUrl(sheetUrlInput.trim());
+      localStorage.setItem("gabriel_sheet_url", sheetUrlInput.trim());
+      setSheetStatus("ok");
+      if (data.length > 0) setRows(data.map(r => ({...r, analisando:false})));
+      else setRows([emptyRow()]);
+    } else {
+      setSheetStatus("error");
+    }
+  }, [sheetUrlInput]);
+
+  // Auto-conectar se já tiver URL salva
+  React.useEffect(() => {
+    if (sheetUrl) { setSheetUrlInput(sheetUrl); conectar(); }
+  }, []);
+
+  const saveRow = useCallback(async (row) => {
+    if (!sheetUrl) return;
+    await syncSheet(sheetUrl, "save", { row: {...row, internalId: row.id} });
+  }, [sheetUrl]);
+
+  const delRow = async (id) => {
+    setRows(r => r.filter(row => row.id !== id));
+    if (sheetUrl) await syncSheet(sheetUrl, "delete", { internalId: id });
+  };
+
+  const updAndSave = (id, f, v) => {
+    setRows(r => {
+      const updated = r.map(row => row.id===id ? {...row,[f]:v} : row);
+      if (sheetUrl) {
+        const row = updated.find(row => row.id===id);
+        if (row) saveRow(row);
+      }
+      return updated;
+    });
+  };
+
+  const analisar = async (id) => {
+    const row = rows.find(r => r.id===id);
+    if (!row || !row.nota || !row.comentario) return;
+    upd(id, "analisando", true);
+    try {
+      const res = await analisarComIA(row.nota, row.comentario, row.jornada);
+      const updated = {
+        ...row, analisando:false,
+        tema: res.tema||row.tema, tipoComentario: res.tipoComentario||row.tipoComentario,
+        tensao: res.tensao||row.tensao, prioridade: res.prioridade||row.prioridade,
+        obs: res.resumoInsight||row.obs, flagCritico: res.prioridade==="P1",
+      };
+      setRows(r => r.map(row => row.id===id ? updated : row));
+      await saveRow(updated);
+    } catch { upd(id,"analisando",false); }
+  };
+
+  const analisarTodos = async () => {
+    setAnalisandoTodos(true);
+    for (const row of rows.filter(r => r.nota && r.comentario && !r.tema)) await analisar(row.id);
+    setAnalisandoTodos(false);
+  };
+
+  const rowsFiltrados = useMemo(() => rows.filter(r => {
+    if (filtroJornada!=="Todas" && r.jornada!==filtroJornada) return false;
+    if (filtroInicio && r.data && r.data < filtroInicio) return false;
+    if (filtroFim && r.data && r.data > filtroFim) return false;
+    return true;
+  }), [rows, filtroJornada, filtroInicio, filtroFim]);
+
+  const analisadas = rowsFiltrados.filter(r => r.tema);
+  const total = analisadas.length;
+  const csatPor = j => { const s=analisadas.filter(r=>r.jornada===j); return s.length?(s.reduce((a,r)=>a+Number(r.nota),0)/s.length).toFixed(1):"—"; };
+  const countPor = j => analisadas.filter(r=>r.jornada===j).length;
+  const dissonantes = analisadas.filter(r=>r.tensao?.startsWith("Dissonante")).length;
+  const silencio = rowsFiltrados.filter(r=>!r.comentario||r.comentario.trim().length<3).length;
+  const p1s = analisadas.filter(r=>r.prioridade==="P1").length;
+  const temaCount = useMemo(()=>{const c={};analisadas.forEach(r=>{if(r.tema)c[r.tema]=(c[r.tema]||0)+1;});return Object.entries(c).sort((a,b)=>b[1]-a[1]);}, [analisadas]);
+  const tensaoCount = useMemo(()=>{const c={"Alinhado":0,"Dissonante positivo":0,"Dissonante negativo":0};analisadas.forEach(r=>{if(r.tensao)c[r.tensao]=(c[r.tensao]||0)+1;});return c;}, [analisadas]);
+
+  return (
+    <div style={{minHeight:"100vh"}} className="bg-gray-50 text-sm">
+      {/* Header */}
+      <div className="bg-white border-b px-6 py-3 flex items-center justify-between">
+        <div>
+          <h1 className="text-base font-bold text-gray-800">Analisador de CSAT — Gabriel CX</h1>
+          <p className="text-xs text-gray-400">Classificação com IA · Experiência & Ocorrência</p>
+        </div>
+        <div className="flex gap-2">
+          {["tabela","painel","config"].map(t => (
+            <button key={t} onClick={()=>setTab(t)}
+              className={`px-4 py-1.5 rounded-full text-xs font-medium border transition-all ${tab===t?"bg-gray-800 text-white border-gray-800":"bg-white text-gray-600 border-gray-300"}`}>
+              {t==="tabela"?"📋 Tabela":t==="painel"?"📊 Painel":"⚙️ Config"}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Status */}
+      {sheetStatus==="ok" && <div className="bg-green-50 border-b border-green-200 px-6 py-1.5 text-xs text-green-700">✅ Conectado ao Google Sheets · dados salvos automaticamente</div>}
+      {sheetStatus==="loading" && <div className="bg-blue-50 border-b border-blue-200 px-6 py-1.5 text-xs text-blue-700">⏳ Conectando ao Google Sheets...</div>}
+      {sheetStatus==="error" && <div className="bg-red-50 border-b border-red-200 px-6 py-1.5 text-xs text-red-700">❌ Não foi possível conectar. Verifique a URL em ⚙️ Config.</div>}
+
+      {/* Config */}
+      {tab==="config" && (
+        <div className="p-6 max-w-xl">
+          <h2 className="font-semibold text-gray-700 mb-1">⚙️ Configuração do Google Sheets</h2>
+          <p className="text-xs text-gray-400 mb-4">Cole a URL do Apps Script. Ela fica salva no navegador — não precisa reconfigurar toda vez.</p>
+          <div className="space-y-3">
+            <div>
+              <label className="text-xs font-medium text-gray-600 block mb-1">URL do Web App</label>
+              <input value={sheetUrlInput} onChange={e=>setSheetUrlInput(e.target.value)}
+                placeholder="https://script.google.com/macros/s/..."
+                className="w-full border rounded px-3 py-2 text-xs"/>
+            </div>
+            <button onClick={conectar} disabled={sheetStatus==="loading"}
+              className="px-4 py-2 bg-indigo-600 text-white rounded text-xs font-medium hover:bg-indigo-700 disabled:opacity-50">
+              {sheetStatus==="loading"?"Conectando...":"Conectar e carregar dados"}
+            </button>
+          </div>
+          <div className="mt-6 bg-gray-50 rounded-lg border p-4 text-xs text-gray-600 space-y-1.5">
+            <p className="font-semibold text-gray-700">📋 Como configurar (uma vez só):</p>
+            <ol className="list-decimal list-inside space-y-1">
+              <li>Crie uma Google Sheet → renomeie a aba para <strong>CSAT</strong></li>
+              <li>Linha 1: <code className="bg-gray-200 px-1 rounded text-xs">internalId, recordId, nome, jornada, data, nota, comentario, tema, tipoComentario, tensao, prioridade, flagCritico, obs</code></li>
+              <li><strong>Extensões → Apps Script</strong> → cole o código fornecido → salve</li>
+              <li><strong>Implantar → Nova implantação</strong> → App da Web → Executar como: Eu → Acesso: Qualquer pessoa</li>
+              <li>Copie a URL e cole acima → clique em Conectar</li>
+            </ol>
+          </div>
+        </div>
+      )}
+
+      {/* Filtros */}
+      {tab !== "config" && (
+        <div className="bg-white border-b px-6 py-2 flex items-center gap-4 flex-wrap">
+          <span className="text-xs text-gray-400 font-medium">Filtros:</span>
+          <div className="flex items-center gap-1">
+            <label className="text-xs text-gray-500">Jornada</label>
+            <select value={filtroJornada} onChange={e=>setFiltroJornada(e.target.value)} className="border rounded px-2 py-1 text-xs bg-white">
+              <option>Todas</option>{JORNADAS.map(j=><option key={j}>{j}</option>)}
+            </select>
+          </div>
+          <div className="flex items-center gap-1">
+            <label className="text-xs text-gray-500">De</label>
+            <input type="date" value={filtroInicio} onChange={e=>setFiltroInicio(e.target.value)} className="border rounded px-2 py-1 text-xs"/>
+          </div>
+          <div className="flex items-center gap-1">
+            <label className="text-xs text-gray-500">Até</label>
+            <input type="date" value={filtroFim} onChange={e=>setFiltroFim(e.target.value)} className="border rounded px-2 py-1 text-xs"/>
+          </div>
+          {(filtroJornada!=="Todas"||filtroInicio||filtroFim) && (
+            <button onClick={()=>{setFiltroJornada("Todas");setFiltroInicio("");setFiltroFim("");}} className="text-xs text-indigo-500 hover:underline">Limpar</button>
+          )}
+          <span className="text-xs text-gray-400 ml-auto">{rowsFiltrados.length} registro(s)</span>
+        </div>
+      )}
+
+      {/* Tabela */}
+      {tab==="tabela" && (
+        <div className="p-4">
+          <div className="flex justify-between items-center mb-3">
+            <p className="text-xs text-gray-500">{analisadas.length} analisado(s)</p>
+            <div className="flex gap-2">
+              <button onClick={analisarTodos} disabled={analisandoTodos}
+                className="px-3 py-1.5 bg-indigo-600 text-white rounded text-xs font-medium disabled:opacity-50">
+                {analisandoTodos?"Analisando...":"⚡ Analisar todos com IA"}
+              </button>
+              <button onClick={addRow} className="px-3 py-1.5 bg-white border border-gray-300 rounded text-xs font-medium">+ Linha</button>
+            </div>
+          </div>
+          <div style={{overflowX:"auto"}} className="rounded-lg border border-gray-200 bg-white">
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="bg-gray-50 border-b text-gray-500 text-left">
+                  {["ID","Nome","Jornada","Data","Nota","Comentário","Tema","Tipo","Tensão","P","🚨","Insight","Ação"].map(h=>(
+                    <th key={h} className="px-2 py-2 font-medium whitespace-nowrap">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rowsFiltrados.map(row=>(
+                  <tr key={row.id} className={`border-b ${row.flagCritico?"bg-red-50":"hover:bg-gray-50"}`}>
+                    <td className="px-2 py-2"><input value={row.recordId} onChange={e=>updAndSave(row.id,"recordId",e.target.value)} placeholder="ID" className="w-20 border rounded px-1.5 py-1 text-xs"/></td>
+                    <td className="px-2 py-2"><input value={row.nome} onChange={e=>updAndSave(row.id,"nome",e.target.value)} placeholder="Nome" className="w-24 border rounded px-1.5 py-1 text-xs"/></td>
+                    <td className="px-2 py-2">
+                      <select value={row.jornada} onChange={e=>updAndSave(row.id,"jornada",e.target.value)} className="border rounded px-1.5 py-1 text-xs bg-white">
+                        {JORNADAS.map(j=><option key={j}>{j}</option>)}
+                      </select>
+                    </td>
+                    <td className="px-2 py-2"><input type="date" value={row.data} onChange={e=>updAndSave(row.id,"data",e.target.value)} className="border rounded px-1.5 py-1 text-xs w-32"/></td>
+                    <td className="px-2 py-2">
+                      <select value={row.nota} onChange={e=>updAndSave(row.id,"nota",e.target.value)} className={`border rounded px-1.5 py-1 text-xs bg-white w-12 ${notaCor(row.nota)}`}>
+                        <option value="">—</option>{[1,2,3,4,5].map(n=><option key={n} value={n}>{n}</option>)}
+                      </select>
+                    </td>
+                    <td className="px-2 py-2"><textarea value={row.comentario} onChange={e=>updAndSave(row.id,"comentario",e.target.value)} placeholder="Comentário..." rows={2} className="w-44 border rounded px-1.5 py-1 text-xs" style={{resize:"none"}}/></td>
+                    <td className="px-2 py-2" style={{minWidth:"8rem"}}>{row.tema?<Badge val={row.tema}/>:<span className="text-gray-300">—</span>}</td>
+                    <td className="px-2 py-2">{row.tipoComentario?<Badge val={row.tipoComentario}/>:<span className="text-gray-300">—</span>}</td>
+                    <td className="px-2 py-2">{row.tensao?<Badge val={row.tensao}/>:<span className="text-gray-300">—</span>}</td>
+                    <td className="px-2 py-2">{row.prioridade?<Badge val={row.prioridade}/>:<span className="text-gray-300">—</span>}</td>
+                    <td className="px-2 py-2 text-center">{row.flagCritico?"🚨":""}</td>
+                    <td className="px-2 py-2 text-gray-500" style={{fontStyle:"italic",maxWidth:"9rem",fontSize:"0.7rem"}}>{row.obs||<span className="text-gray-300">—</span>}</td>
+                    <td className="px-2 py-2">
+                      <div className="flex gap-1">
+                        <button onClick={()=>analisar(row.id)} disabled={row.analisando||!row.nota||!row.comentario}
+                          className="px-2 py-1 bg-indigo-50 text-indigo-600 rounded text-xs border border-indigo-200 disabled:opacity-30">
+                          {row.analisando?"...":"⚡"}
+                        </button>
+                        <button onClick={()=>delRow(row.id)} className="px-2 py-1 bg-red-50 text-red-500 rounded text-xs border border-red-200">✕</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Painel */}
+      {tab==="painel" && (
+        <div className="p-4" style={{display:"flex",flexDirection:"column",gap:"1rem"}}>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0.75rem"}}>
+            {JORNADAS.map(j=>{
+              const csat=csatPor(j); const n=countPor(j);
+              const [cor,corT,corN]=j==="Experiência"?["border-blue-200 bg-blue-50","text-blue-700","text-blue-800"]:["border-emerald-200 bg-emerald-50","text-emerald-700","text-emerald-800"];
+              return (
+                <div key={j} className={`rounded-lg border p-4 ${cor}`}>
+                  <p className={`text-xs font-semibold mb-1 ${corT}`}>CSAT — {j}</p>
+                  <p className={`text-3xl font-bold ${corN}`}>{csat}<span className="text-base font-normal"> /5</span></p>
+                  <p className={`text-xs mt-1 ${corT}`}>{n} resposta(s) analisada(s)</p>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:"0.75rem"}}>
+            {[
+              {label:"🚨 Críticos P1",value:p1s,sub:"ação imediata",color:"text-red-600"},
+              {label:"⚡ Taxa de Dissonância",value:total?`${Math.round(dissonantes/total*100)}%`:"—",sub:`${dissonantes} respostas`,color:"text-purple-600"},
+              {label:"🤐 Índice de Silêncio",value:silencio,sub:"sem comentário",color:"text-orange-500"},
+            ].map(k=>(
+              <div key={k.label} className="bg-white rounded-lg border p-4">
+                <p className="text-xs text-gray-400 mb-1">{k.label}</p>
+                <p className={`text-2xl font-bold ${k.color}`}>{k.value}</p>
+                <p className="text-xs text-gray-400 mt-1">{k.sub}</p>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"0.75rem"}}>
+            <div className="bg-white rounded-lg border p-4">
+              <h3 className="font-semibold text-gray-700 mb-3 text-sm">🏷️ Temas mais frequentes</h3>
+              {temaCount.length===0?<p className="text-gray-400 text-xs">Nenhum dado ainda</p>:
+                temaCount.map(([tema,cnt])=>(
+                  <div key={tema} className="mb-2">
+                    <div className="flex justify-between text-xs text-gray-600 mb-0.5"><span>{tema}</span><span className="font-semibold">{cnt}</span></div>
+                    <Bar value={cnt} max={temaCount[0]?.[1]} color="bg-indigo-400"/>
+                  </div>
+                ))}
+            </div>
+            <div className="bg-white rounded-lg border p-4">
+              <h3 className="font-semibold text-gray-700 mb-3 text-sm">⚡ Tensão Nota-Discurso</h3>
+              {total===0?<p className="text-gray-400 text-xs">Nenhum dado ainda</p>:
+                Object.entries(tensaoCount).map(([tensao,cnt])=>{
+                  const colors={"Alinhado":"bg-blue-400","Dissonante positivo":"bg-purple-400","Dissonante negativo":"bg-orange-400"};
+                  return (
+                    <div key={tensao} className="mb-3">
+                      <div className="flex justify-between text-xs text-gray-600 mb-0.5"><span>{tensao}</span><span className="font-semibold">{cnt} ({total?Math.round(cnt/total*100):0}%)</span></div>
+                      <Bar value={cnt} max={total} color={colors[tensao]}/>
+                    </div>
+                  );
+                })}
+              <div className="mt-4 p-3 bg-purple-50 rounded text-xs text-purple-700 border border-purple-200">
+                <strong>💡</strong> Respostas dissonantes são onde a nota sozinha teria te enganado.
+              </div>
+            </div>
+          </div>
+          {rows.filter(r=>r.prioridade==="P1"&&(filtroJornada==="Todas"||r.jornada===filtroJornada)).length>0&&(
+            <div className="bg-white rounded-lg border border-red-200 p-4">
+              <h3 className="font-semibold text-red-600 mb-3 text-sm">🚨 Casos P1 — Ação Imediata</h3>
+              <div style={{display:"flex",flexDirection:"column",gap:"0.5rem"}}>
+                {rows.filter(r=>r.prioridade==="P1"&&(filtroJornada==="Todas"||r.jornada===filtroJornada)).map(r=>(
+                  <div key={r.id} className="flex items-start gap-3 p-2 bg-red-50 rounded border border-red-100">
+                    <span className="text-red-600 font-bold text-sm" style={{flexShrink:0}}>{r.nota}★</span>
+                    <div style={{flex:1,minWidth:0}}>
+                      <p className="text-xs font-medium text-gray-700">{r.nome||r.recordId||"Sem nome"} · <span className="text-gray-400">{r.jornada}</span>{r.data?` · ${r.data}`:""}</p>
+                      <p className="text-xs text-gray-500" style={{fontStyle:"italic",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>"{r.comentario?.slice(0,80)}{r.comentario?.length>80?"...":""}"</p>
+                      {r.obs&&<p className="text-xs text-red-600 mt-0.5">→ {r.obs}</p>}
+                    </div>
+                    <div style={{flexShrink:0}}>{r.tema&&<Badge val={r.tema}/>}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.render(<App/>, document.getElementById("root"));
+</script>
+</body>
+</html>
