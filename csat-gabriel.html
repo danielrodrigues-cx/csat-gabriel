@@ -73,10 +73,17 @@ Regras: Dissonante positivo=nota baixa+comentário neutro/positivo. Dissonante n
 }
 
 async function syncSheet(url, action, payload) {
-  try { await fetch(url, {method:"POST", body:JSON.stringify({action,...payload})}); } catch {}
+  try {
+    const body = JSON.stringify({action, ...payload});
+    await fetch(url, {method:"POST", mode:"no-cors", headers:{"Content-Type":"text/plain"}, body});
+  } catch {}
 }
 async function loadSheet(url) {
-  try { const res = await fetch(url); const data = await res.json(); return data.ok ? data.data : null; } catch { return null; }
+  try {
+    const res = await fetch(url + "?ts=" + Date.now());
+    const data = await res.json();
+    return data.ok ? data.data : null;
+  } catch { return null; }
 }
 
 function App() {
