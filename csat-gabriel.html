@@ -100,6 +100,60 @@ function App() {
   const upd = (id, f, v) => setRows(r => r.map(row => row.id===id ? {...row,[f]:v} : row));
   const addRow = () => setRows(r => [...r, emptyRow()]);
 
+  const importCSV = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const text = ev.target.result.replace(/^\uFEFF/,"");
+      const lines = text.split("\n").filter(l => l.trim());
+      if (lines.length < 2) return;
+      const sep = lines[0].includes(";") ? ";" : ",";
+      const headers = lines[0].split(sep).map(h => h.trim().replace(/^"|"$/g,"").toLowerCase());
+      const idx = (name) => headers.findIndex(h => h === name.toLowerCase());
+      const parsed = lines.slice(1).map(line => {
+        const cols = line.match(/(".*?"|[^;,]+)(?=[;,]|$)/g) || line.split(sep);
+        const get = (...names) => { for (const n of names) { const v = (cols[idx(n)]||"").replace(/^"|"$/g,"").trim(); if (v) return v; } return ""; };
+        return {
+          ...emptyRow(),
+          recordId:   get("record id","recordid","recordId","recordIs","id"),
+          nome:       get("nome","name"),
+          jornada:    get("jornada") || "Experiência",
+          data:       get("data","date"),
+          nota:       get("nota","note","score"),
+          comentario: get("comentário","comentario","comment"),
+          tema:       get("tema"),
+          tipoComentario: get("tipocomentario","tipo"),
+          tensao:     get("tensão","tensao"),
+          prioridade: get("prioridade"),
+          flagCritico: get("flagcritico","flag critico").toUpperCase() === "SIM",
+          obs:        get("obs"),
+        };
+      }).filter(r => r.nota || r.comentario);
+      setRows(parsed);
+    };
+    reader.readAsText(file, "UTF-8");
+    e.target.value = "";
+  };
+
+  const exportCSV = () => {
+    const headers = ["recordId","nome","jornada","data","nota","comentario","tema","tipoComentario","tensao","prioridade","flagCritico","obs"];
+    const csvRows = [headers.join(";")];
+    rows.forEach(r => {
+      csvRows.push([
+        r.recordId, r.nome, r.jornada, r.data, r.nota,
+        `"${(r.comentario||"").replace(/"/g,'""')}"`,
+        r.tema, r.tipoComentario, r.tensao, r.prioridade,
+        r.flagCritico?"SIM":"", `"${(r.obs||"").replace(/"/g,'""')}"`
+      ].join(";"));
+    });
+    const blob = new Blob(["\uFEFF" + csvRows.join("\n")], {type:"text/csv;charset=utf-8;"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `csat-gabriel-${new Date().toISOString().slice(0,10)}.csv`;
+    a.click(); URL.revokeObjectURL(url);
+  };
+
   const conectar = useCallback(async () => {
     if (!sheetUrlInput.trim()) return;
     setSheetStatus("loading");
@@ -269,6 +323,11 @@ function App() {
                 className="px-3 py-1.5 bg-indigo-600 text-white rounded text-xs font-medium disabled:opacity-50">
                 {analisandoTodos?"Analisando...":"⚡ Analisar todos com IA"}
               </button>
+              <label className="px-3 py-1.5 bg-white border border-gray-300 rounded text-xs font-medium hover:bg-gray-50 cursor-pointer">
+                ⬆️ Importar CSV
+                <input type="file" accept=".csv" onChange={importCSV} style={{display:"none"}}/>
+              </label>
+              <button onClick={exportCSV} className="px-3 py-1.5 bg-white border border-gray-300 rounded text-xs font-medium hover:bg-gray-50">⬇️ Exportar CSV</button>
               <button onClick={addRow} className="px-3 py-1.5 bg-white border border-gray-300 rounded text-xs font-medium">+ Linha</button>
             </div>
           </div>
